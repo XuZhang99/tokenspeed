@@ -46,6 +46,11 @@ SUPPORTED_HEAD_DIM = 128
 
 _chunk_gated_delta_rule = None
 _AVAILABLE = False
+# Whether flashinfer's checkpoint (output_h=True) prefill path is trustworthy.
+# On Blackwell it dispatches to the CuTe DSL kernel (correct + fast). On Hopper
+# sm90 the C++ checkpoint kernel can emit NaNs under varlen batched serving, so
+# the caller must fall back to the Triton FLA path for output_h there.
+_OUTPUT_H_SUPPORTED = False
 
 if current_platform().is_nvidia:
     try:
@@ -71,6 +76,8 @@ if current_platform().is_nvidia:
         )
         _is_hopper = _p.arch_version.major == 9
         _AVAILABLE = _is_blackwell or _is_hopper
+        # output_h checkpoint path is only trusted on the Blackwell CuTe kernel.
+        _OUTPUT_H_SUPPORTED = _is_blackwell
     except ImportError:
         _AVAILABLE = False
 
@@ -78,6 +85,16 @@ if current_platform().is_nvidia:
 def is_available() -> bool:
     """Whether the flashinfer GDN prefill kernel can run on this platform."""
     return _AVAILABLE
+
+
+def is_output_h_supported() -> bool:
+    """Whether flashinfer's output_h (checkpoint) prefill path is trustworthy.
+
+    True on Blackwell (CuTe DSL kernel); False on Hopper sm90, where the C++
+    checkpoint kernel can emit NaNs under varlen batched serving. Callers that
+    need per-chunk h on sm90 must use the Triton FLA path instead.
+    """
+    return _OUTPUT_H_SUPPORTED
 
 
 def is_supported(

@@ -39,6 +39,9 @@ from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from tokenspeed.runtime.layers.attention.linear.chunk import (
+    chunk_gated_delta_rule as chunk_gated_delta_rule_triton,
+)
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
@@ -629,19 +632,44 @@ class MambaAttnBackend(AttentionBackend):
         """Compute src/dst indices for extracting intermediate SSM states.
 
         Matching conv windows are gathered separately from packed pre-conv inputs.
+
+        The src index targets whichever per-chunk state buffer ``forward_extend``
+        produces, which depends on architecture:
+        - Hopper sm90 (Triton FLA ``h``): ``h[i]`` is the state *before* chunk
+          ``i``, so a chunk-aligned boundary at ``lens`` maps to
+          ``h[lens // C]``; per-seq chunk count is ceil-div ``(L-1)//C + 1``.
+        - Blackwell (flashinfer checkpoint buffer): ``ckpts[k]`` is the state
+          *after* chunk ``k``, so the boundary maps to ``ckpts[lens // C - 1]``;
+          per-seq checkpoint count is ``L // C`` (full chunks only).
         """
-        # flashinfer ckpts[k] = state after processing chunk k = FLA h[k+1]
-        num_fi_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
-        offset = torch.zeros_like(num_fi_ckpts)
-        offset[1:] = torch.cumsum(num_fi_ckpts[:-1], dim=0)
+        if gdn_flashinfer.is_output_h_supported():
+            # Blackwell flashinfer checkpoint-buffer convention.
+            num_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
+            offset = torch.zeros_like(num_ckpts)
+            offset[1:] = torch.cumsum(num_ckpts[:-1], dim=0)
+
+            lens_m = track_lens[track_mask]
+            offset_m = offset[track_mask]
+            dst_m = mamba_track_indices[track_mask]
+
+            # ckpts[lens//C - 1] = state after lens tokens. track_mask guarantees
+            # lens_m >= FLA_CHUNK_SIZE, so lens_m // C >= 1.
+            track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE - 1)
+            track_ssm_h_dst = dst_m
+            return (track_ssm_h_src, track_ssm_h_dst)
+
+        # Hopper sm90 Triton FLA h convention.
+        num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
+        offset = torch.zeros_like(num_h_states)
+        offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
 
         lens_m = track_lens[track_mask]
         offset_m = offset[track_mask]
-        dst_m = mamba_track_indices[track_mask]
+        dst_m = mamba_track_indices[track_mask]  # write to TRACKING slots
 
-        # FLA h[lens//C] = flashinfer ckpts[lens//C - 1].
-        # track_mask guarantees lens_m >= FLA_CHUNK_SIZE so lens_m // C >= 1.
-        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE - 1)
+        # h[i] is the state before chunk i, so an aligned lens maps directly to
+        # lens // FLA_CHUNK_SIZE.
+        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE)
         track_ssm_h_dst = dst_m
 
         return (
@@ -1121,19 +1149,46 @@ class MambaAttnBackend(AttentionBackend):
                     )
                 self._gdn_fastpath_checked = True
             if need_h_track:
-                core_attn_out, last_recurrent_state, fi_h_checkpoints, _ = (
-                    gdn_flashinfer.gdn_chunk_prefill(
-                        l2norm_fwd(query),
-                        l2norm_fwd(key),
-                        value,
-                        g,
-                        beta,
-                        scale=head_k_dim**-0.5,
-                        initial_state=recurrent_state,
-                        cu_seqlens=query_start_loc,
-                        output_h=True,
+                if gdn_flashinfer.is_output_h_supported():
+                    # Blackwell: flashinfer's CuTe checkpoint kernel returns the
+                    # per-chunk state in its native checkpoint buffer (indexed by
+                    # the flashinfer convention in _compute_track_ssm_indices).
+                    core_attn_out, last_recurrent_state, h, _ = (
+                        gdn_flashinfer.gdn_chunk_prefill(
+                            l2norm_fwd(query),
+                            l2norm_fwd(key),
+                            value,
+                            g,
+                            beta,
+                            scale=head_k_dim**-0.5,
+                            initial_state=recurrent_state,
+                            cu_seqlens=query_start_loc,
+                            output_h=True,
+                        )
                     )
-                )
+                else:
+                    # Hopper sm90: flashinfer's C++ checkpoint (output_h) kernel can
+                    # emit NaNs under varlen batched serving, so use the Triton FLA
+                    # kernel, which returns the full per-chunk h tensor directly.
+                    # The non-checkpoint path below still uses the flashinfer
+                    # fast-path. Index convention matches _compute_track_ssm_indices.
+                    core_attn_out, last_recurrent_state, h = (
+                        chunk_gated_delta_rule_triton(
+                            q=query,
+                            k=key,
+                            v=value,
+                            g=g,
+                            beta=beta,
+                            scale=head_k_dim**-0.5,
+                            initial_state=recurrent_state,
+                            output_final_state=True,
+                            cu_seqlens=query_start_loc,
+                            head_first=False,
+                            use_qk_l2norm_in_kernel=True,
+                            output_h=True,
+                        )
+                    )
+                    h = h.squeeze(0)
             else:
                 core_attn_out, last_recurrent_state = gdn_flashinfer.gdn_chunk_prefill(
                     l2norm_fwd(query),
@@ -1149,7 +1204,7 @@ class MambaAttnBackend(AttentionBackend):
             ssm_states[cache_indices] = last_recurrent_state
 
             if need_h_track:
-                ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
+                ssm_states[self.forward_metadata.track_ssm_h_dst] = h[
                     self.forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
 
