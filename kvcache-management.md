@@ -266,10 +266,15 @@ buffer 名。
 ## 4. LCM two-level 分配（flat-state 模型）
 
 hybrid / flat-state 模型（Qwen3.5 GDN、Kimi-K3 KDA、Inkling ShortConv）的 KV-cache
-走统一的 **LCM（logical cache memory）two-level** 体系（PR #804）。它把异构的
+走统一的 **LCM two-level** 体系（PR #804）。它把异构的
 history KV + linear-attention state 打包进**一块 budget 大小的 arena**，几何由单一
 `cache_budget_bytes` 精确推导。（旧的 flat-slab 体系 `flat_hybrid.py` /
 `flat_state_slabs.py` / `hybrid_cache_plan.py` / `flat_memory_plan.py` 已删除。）
+
+> 📄 **本节是概览；完整展开见根目录 [`lcm.md`](lcm.md)**——独立成文，详解 LCM 名字
+> 由来（parent 字节按所有 group 的 packing 因子求**最小公倍数（Least Common
+> Multiple）**对齐，`lcm_memory_plan.py:401`）、几何层 / recipe / setup / pool 全链路、
+> `exact_page_stride` 两类 kernel、端到端数值示例与文件索引。
 
 ### 4.1 核心概念
 
