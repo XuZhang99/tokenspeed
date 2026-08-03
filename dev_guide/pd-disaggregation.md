@@ -1,5 +1,5 @@
 # PD 分离（Prefill/Decode Disaggregation）详解
-##### commit-id: d50bb481505c229f93594e56d5e1f8a772876451
+##### commit-id: 638b9de0e698446b5e50a2a9508778b2f59473f6
 
 本文详细介绍 TokenSpeed 的 **PD 分离**功能：把一次生成请求的 **prefill**（算完整
 prompt 的 KV，采样出第一个 token）和 **decode**（逐 token 增量生成）拆到两组不同的
@@ -50,14 +50,16 @@ CUDA graph 策略。
 ```
 
 传输后端由 `TransferBackend`（`utils.py:132`）枚举选择，只有两个成员：`MOONCAKE`
-（`"mooncake"`）和 `MOONCAKE_ASYNC`（`"mooncake_async"`）——**没有 NCCL / NIXL**
-（NCCL 只在 EPD 里做 embedding 行分片重组，不在 PD KV 路径）。默认走同步的
+（`"mooncake"`，`:133`）和 `MOONCAKE_ASYNC`（`"mooncake_async"`，`:134`）——**没有
+NCCL / NIXL**（NCCL 只在 EPD 里做 embedding 行分片重组，不在 PD KV 路径）。默认走同步的
 `MOONCAKE`；`MOONCAKE_ASYNC` 见 [§10](#10-mooncake_async-异步后端现状)（当前与重构
-后的同步路径不同步，构造即会失败，实际是遗留分支）。
+后的同步路径不同步，构造即会失败，实际是遗留分支）。`get_kv_class`（`utils.py:149`）按后
+端 + `KVClassType` 挑管理器类：同步后端拆成 prefill/decode 两个 manager，异步后端只有一
+个角色中立的 `KVClassType.MANAGER`（`:191`）。
 
 一次请求的 rendezvous 键是 **`bootstrap_room`**（一个 int）；它同时是控制面 ZMQ 每
 条消息的 key、状态 FSM `request_status` 的 key，也用来选 prefill 的 DP group
-（`room % dp_size`，`mooncake/receiver.py:513`）。
+（`room % dp_size`，`mooncake/receiver.py:495`）。
 
 ## 目录结构
 
@@ -66,7 +68,7 @@ python/tokenspeed/runtime/pd/
 ├── factory.py            create_kv_transfer + get_kv_args：造 Executor 和 KVArgs
 ├── prefill_executor.py   DisaggPrefillExecutor：prefill 侧每步编排 + 事件泵
 ├── decode_executor.py    DisaggDecodeExecutor：decode 侧每步编排 + 事件泵
-├── flatkv.py             FlatKV PD 的结构化 layout / manifest 契约（版本化、带校验）
+├── cache_protocol.py     Paged-cache PD 的结构化 layout / manifest 契约（版本化、带校验）
 ├── transfer_plan.py      异构 TP 的传输分片规划器（PDTransferPlanner）
 ├── kv_events.py          （非 PD 传输）scheduler KV-cache 变更事件的 ZMQ publisher
 ├── utils.py              枚举、FastQueue、StepCounter、MetadataBuffers 等公共件
@@ -96,17 +98,17 @@ PD 由几个 `disaggregation_*` server-arg 驱动，定义在
 `engine/utils/server_args.py`（下面几个锚点相对
 `python/tokenspeed/runtime/utils/server_args.py`）：
 
-- `disaggregation_mode: str = "null"`（`:297`）：`"null"`（聚合式，不分离）/
+- `disaggregation_mode: str = "null"`（`:333`）：`"null"`（聚合式，不分离）/
   `"prefill"` / `"decode"` / `"encode"`（EPD 里的纯 vision-tower 节点）。argparse 在
-  `:1874`-`:1880` 注册，`choices=["null","prefill","decode","encode"]`。
-- `disaggregation_bootstrap_port: int = 8998`（`:298`）：prefill 侧 bootstrap HTTP 服
+  `:2003`-`:2006` 注册，`choices=["null","prefill","decode","encode"]`。
+- `disaggregation_bootstrap_port: int = 8998`（`:334`）：prefill 侧 bootstrap HTTP 服
   务器端口。
-- `disaggregation_transfer_backend: str = "mooncake"`（`:299`，argparse `:1898`）：
+- `disaggregation_transfer_backend: str = "mooncake"`（`:335`，argparse `:2027`）：
   `mooncake` / `mooncake_async`。
-- `disaggregation_ib_device: str | None = None`（`:300`）：IB 设备名，支持单个
+- `disaggregation_ib_device: str | None = None`（`:336`）：IB 设备名，支持单个
   （`mlx5_0`）或逗号分隔多个；None 走 Mooncake 自动探测。
-- `disaggregation_layerwise_interval: int = 1`（`:301`）：layerwise 流式传输的层间隔。
-- `pdlb_url: str | None = None`（`:302`）：PD 负载均衡器 URL，设了的话
+- `disaggregation_layerwise_interval: int = 1`（`:337`）：layerwise 流式传输的层间隔。
+- `pdlb_url: str | None = None`（`:338`）：PD 负载均衡器 URL，设了的话
   prefill/decode 节点启动时向它注册（`utils.py:235` 的
   `register_disaggregation_server`）。
 
@@ -114,13 +116,15 @@ PD 由几个 `disaggregation_*` server-arg 驱动，定义在
 > 逐请求的，随 `BootstrapInfo.bootstrap_host`（`base/bootstrap.py:37`）传，和
 > `bootstrap_port`（`:38`）、`bootstrap_room`（`:39`）一起。
 
-**模式解析与约束**在 `resolve_disaggregation()`（`server_args.py:635`）：
-- `prefill`（`:637`）：强制 `enforce_eager=True`，**prefill 节点关 CUDA graph**（每个
+**模式解析与约束**在 `resolve_disaggregation()`（`server_args.py:751`）：
+- `prefill`（`:753`）：强制 `enforce_eager=True`，**prefill 节点关 CUDA graph**（每个
   请求 prompt 长度不同，capture 无收益）。
-- `decode`（`:640`）：prefix caching 保持可配。
-- `encode`（`:646`）：纯 vision tower，关 prefix cache，拒绝 attn-DP。
-- `prefill` + 非 `round_robin` 负载均衡 + attn-DP → `ValueError`（`:660`-`669`）。
-- `_handle_kvstore()`（`:671`）：`decode`/`encode` 强制关 kvstore（L3 外部存储）。
+- `decode`（`:756`）：prefix caching 保持可配（只 log 当前值）。
+- `encode`（`:762`）：纯 vision tower，关 prefix cache（`:771`）；attn-DP 内
+  `data_parallel_size>1` 直接 `ValueError`（`:765`-770，横向扩容起多个独立 encode server）。
+- `prefill` + 非 `round_robin` 负载均衡 + attn-DP → `ValueError`（`:776`-`:786`）。
+- `_handle_kvstore()`（`:787`）：只有 `encode` 强制关 kvstore（`:788`-793）；其余模式未
+  显式 `--disable-kvstore` 时**默认开启**外部存储（`:794`-795）。
 
 **Executor 的构造**在 `event_loop.py`：`disaggregation_mode != "null"` 时
 （`event_loop.py:586`）先用 `get_kv_args(...)`（`:587`）拿 KV buffer 描述符，再拼
