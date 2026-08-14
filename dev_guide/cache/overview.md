@@ -1,6 +1,6 @@
 # CachePool 总览与继承体系
 
-[返回目录](../cache.md) · [子类逐类详解](pools/README.md) · [下一篇：CacheLayout](layout.md)
+[返回目录](../cache.md) · [CachePoolSpec](pool-spec.md) · [子类逐类详解](pools/README.md) · [下一篇：CacheLayout](layout.md)
 
 `CachePool` 定义在
 [`python/tokenspeed/runtime/layers/attention/kv_cache/base.py`](../../python/tokenspeed/runtime/layers/attention/kv_cache/base.py)，
