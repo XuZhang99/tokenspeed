@@ -60,6 +60,100 @@ fields：计算代码看到的 Tensor 视图
 除此之外，plan 还保存 `num_lcm_blocks`、`lcm_block_bytes` 和
 `logical_block_tokens` 等整体几何信息。
 
+## `logical_block_tokens`：统一的逻辑分页粒度
+
+`logical_block_tokens` 通常记为 `P`，表示 scheduler 的一个逻辑 page 对应多少个
+token。它是整个 plan 共享的逻辑分页粒度，创建 runtime contract 时会成为：
+
+```python
+PagedCacheRuntimeContract(
+    block_size=plan.logical_block_tokens,
+    ...,
+)
+```
+
+普通 MHA/MLA 场景中，它通常等于 `AttentionConfig.page_size`。例如：
+
+```text
+logical_block_tokens = 128
+```
+
+表示 scheduler 每 128 个 token 使用一个逻辑 page。普通 MHA 的 K/V field 页内
+shape 也会以它作为第一个维度：
+
+```text
+K page shape = [128, kv_head_num, head_dim]
+V page shape = [128, kv_head_num, head_dim]
+```
+
+### 它参与哪些计算
+
+它主要用于：
+
+- 定义 scheduler/runtime contract 的基础 `block_size`；
+- 计算普通 group 的几何 token 槽位数；
+- 检查 backend kernel page size 能否整除 scheduler logical page；
+- 协调不同 cache group 在同一个 LCM plan 下的分页粒度。
+
+例如有 10 个可用 LCM 父块，某 group 的 packing 为 4：
+
+```text
+usable child pages = 10 × 4 = 40
+page_count = 1 + 40 = 41              # 包含 null page 0
+geometric token slots = 40 × 128 = 5120
+```
+
+`CachePoolSpec.pool_size` 也使用最大 group packing 计算：
+
+```text
+pool_size = num_lcm_blocks × max_packing × logical_block_tokens
+```
+
+### 与 kernel/group page size 的区别
+
+普通 MHA 中以下三个值通常相同：
+
+```text
+logical_block_tokens
+    = scheduler logical page size
+    = KV field 每页的 token 行数
+    = attention kernel page size
+```
+
+异构 cache 中不能假设它们始终相同。Backend 的 kernel page 可以更小，但必须整除
+`logical_block_tokens`：
+
+```text
+logical_block_tokens % kernel_page_size == 0
+```
+
+此时 backend 会把一个 scheduler logical page 展开成多个 kernel page。某个 group
+自己的一个 CacheBlock 覆盖多少原始 token，则由 `PagedCacheGroupSpec` 描述：
+
+```text
+group cache block tokens = rows_per_page × entry_stride_tokens
+```
+
+DeepSeek V4 的 compressed/state group 就会使用这种 group-specific 几何。因此，想
+知道 scheduler 的统一 page 粒度时读取 `logical_block_tokens`；想知道某个 group 或
+kernel 的真实行数和 token span 时，应读取对应 group spec 和 backend page size。
+
+### 常见取值
+
+| Recipe | `logical_block_tokens` |
+| --- | --- |
+| 普通 MHA/MLA/DSA/MSA | `config.page_size` |
+| Qwen GDN | 128 |
+| Inkling | 128 |
+| Kimi K3 | 128 |
+| DeepSeek V4 | 256 |
+
+它不表示物理字节数、page 数量或最终准入容量：
+
+- 物理父块字节数看 `lcm_block_bytes`；
+- 某个 group 的 page 数看 `group.page_count`；
+- scheduler 最终可接纳 token 数看 `CachePoolSpec.token_capacity`。
+
 ## `groups`：逻辑分页组
 
 每个元素是一个 `CacheGroupLayout`：
@@ -137,6 +231,58 @@ arena
 ```text
 (num_lcm_blocks + 1) * bytes_per_lcm_block
 ```
+
+### `arena_offset_bytes` 如何计算
+
+`arena_offset_bytes` 是从 `CachePool.buffer[0]` 到该 plane 第一个字节的距离，单位是
+bytes。它不是设备地址、Tensor id、page offset 或 field offset。
+
+第一个 plane 从 0 开始；后续 plane 的起点等于前面所有 plane 完整长度的前缀和：
+
+```text
+first_plane.arena_offset_bytes = 0
+
+next_plane_offset =
+    current_plane_offset
+    + (num_lcm_blocks + 1) * current_plane.bytes_per_lcm_block
+```
+
+`+1` 表示每个 plane 都包含一段 null parent 空间。因为 plane 总长度依赖实际的
+`num_lcm_blocks`，容量无关的 `CacheLayout` 只保存 `plane_bytes`；调用
+`with_num_lcm_blocks()` 生成 `CacheMemoryPlan` 时才计算 `arena_offset_bytes`。
+
+例如有两个可用父块：
+
+```text
+num_lcm_blocks = 2
+
+K plane:
+  bytes_per_lcm_block = 1024
+  arena_offset_bytes = 0
+  total bytes = (2 + 1) × 1024 = 3072
+
+V plane:
+  bytes_per_lcm_block = 2048
+  arena_offset_bytes = 3072
+  total bytes = (2 + 1) × 2048 = 6144
+```
+
+对应的 plane-major arena 为：
+
+```text
+buffer[0:3072]       → K plane：null parent + 2 个可用 parent
+buffer[3072:9216]    → V plane：null parent + 2 个可用 parent
+```
+
+因此定位一个具体 field 时需要逐层组合三种 offset：
+
+```text
+arena_offset_bytes   定位整个 plane
+page_stride_bytes    定位 plane 内的逻辑 page
+field_offset_bytes   定位 page 内的具体 field
+```
+
+完整寻址公式见后文 [Field 的实际字节地址](#field-的实际字节地址)。
 
 Plane 还描述物理复用关系：不同 group 的 field 如果使用相同 `plane_id`，就会
 用各自的 packing 和 page stride 解释同一段物理字节。例如一个 8 字节 plane
