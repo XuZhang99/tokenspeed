@@ -1,15 +1,58 @@
 # CacheMemoryPlan：容量绑定的物理计划
 
-[上一篇：CacheLayout](layout.md) · [返回目录](../cache.md) · [下一篇：Arena 与 field()](field-binding.md)
+[上一篇：CacheLayout](layout.md) · [返回目录](../cache.md) · [下一篇：CachePoolSpec](pool-spec.md)
 
 `CachePool` 不自行计算物理布局，而是执行 recipe 生成的 `CacheMemoryPlan`。
 该类型定义在
 [`python/tokenspeed/runtime/layers/attention/kv_cache/recipes/plan.py`](../../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/plan.py)。
 
+`CacheMemoryPlan` 是容量已经确定的静态字节几何。它不持有 Tensor、dtype、device
+或 scheduler 状态，只使用整数和 tuple 描述一块共享 LCM arena 应当怎样分配与解释。
+
+```python
+@dataclass(frozen=True)
+class CacheMemoryPlan:
+    logical_block_tokens: int
+    lcm_block_bytes: int
+    num_lcm_blocks: int
+    groups: tuple[CacheGroupLayout, ...]
+    planes: tuple[CachePlaneLayout, ...] = ()
+    fields: tuple[CacheFieldLayout, ...] = ()
+```
+
+它在 cache 创建链路中的位置如下：
+
+```text
+CacheFieldSpec
+    ↓ solve_cache_layout()
+CacheLayout                         容量无关：描述一个 LCM 父块
+    ↓ with_num_lcm_blocks(N)
+CacheMemoryPlan                     容量已绑定：描述完整 arena
+    ↓ 放入 CachePoolSpec
+create_cache_pool()
+    ↓
+CachePool                           分配 arena 并建立 Tensor view
+```
+
+顶层字段的含义如下：
+
+| 字段 | 含义 |
+| --- | --- |
+| `logical_block_tokens` | 一个逻辑 CacheBlock 表示的 token 数，也是 runtime contract 的基础 block size。 |
+| `lcm_block_bytes` | 一个 LCM 父块跨全部 plane 的总字节数。 |
+| `num_lcm_blocks` | 可用 LCM 父块数量，不包含保留的 null parent。 |
+| `groups` | 每个逻辑 page-id 空间的 packing 和最终 page 数。 |
+| `planes` | 完整 arena 中各物理 slab 的宽度和起始 offset。 |
+| `fields` | 计算字段在 group、plane 和 child page 内的具体几何。 |
+
+`frozen=True` 只阻止字段被重新赋值；更重要的是，生产路径通过已经校验过的
+`CacheLayout.with_num_lcm_blocks()` 创建 plan，使 pool、scheduler、PD 和 Host L2
+看到同一份不可变几何。
+
 Plan 中最重要的三个集合分别处在不同层次：
 
 ```text
-groups：调度和分页语义
+groups：逻辑 page-id 空间与 packing
 planes：物理内存及复用关系
 fields：计算代码看到的 Tensor 视图
 ```
@@ -29,7 +72,7 @@ class CacheGroupLayout:
     page_count: int
 ```
 
-一个 group 表示一组具有相同分页、packing 和 retention 语义的缓存，例如：
+一个 group 表示一组共享 page-id 空间和 packing 的缓存，例如：
 
 - `full_attention`
 - `sliding_attention`
@@ -58,8 +101,9 @@ state           packing = 8 → page_count = 1 + 10 × 8 = 81
 ```
 
 Full-attention page 较大，一个父块只能放一个；state page 较小，一个父块可以放
-多个。Group 是 scheduler 能看到的维度，scheduler 根据它管理 page id、retention、
-sliding window 和 state snapshot 等语义。
+多个。Group id 是物理 plan 与 scheduler contract 的连接键，但 retention、sliding
+window、history/state family 和 PD transfer policy 不存放在 `CacheGroupLayout` 中，
+而是由 `CachePoolSpec.paged_cache_group_specs` 中同名的 `PagedCacheGroupSpec` 提供。
 
 ## `planes`：物理内存平面
 
@@ -247,3 +291,279 @@ page_count = 1 + num_lcm_blocks * cache_blocks_per_lcm_block
 
 其中 page 0 是 null page。一个 LCM 父块可以为不同 group 容纳不同数量的子
 CacheBlock，从而让尺寸不同的 KV、SWA 和 state page 共享统一的父块编号体系。
+
+## 从 `CacheLayout` 创建 Plan
+
+生产代码不会让 `CachePool` 临时拼装 plan。Recipe 先调用 `solve_cache_layout()` 求出
+一个父块的容量无关布局，再根据显存预算计算 `num_lcm_blocks`，最后调用：
+
+```python
+plan = layout.with_num_lcm_blocks(num_lcm_blocks)
+```
+
+该方法完成三件事。
+
+### 1. 展开 group 容量
+
+对 `CacheLayout.group_packing` 中的每个 `(group_id, packing)` 创建：
+
+```python
+CacheGroupLayout(
+    group_id=group_id,
+    cache_blocks_per_lcm_block=packing,
+    page_count=1 + num_lcm_blocks * packing,
+)
+```
+
+`num_lcm_blocks` 必须是正整数，并且 `num_lcm_blocks * packing` 不能超过
+32 位 kernel page id 的上限 `2^31 - 1`。
+
+### 2. 展开 plane offset
+
+Plane 使用 plane-major 布局。第一个 plane 从 0 开始，后续 plane 的 offset 按下面的
+公式累加：
+
+```text
+next_plane_offset =
+    current_plane_offset
+    + (num_lcm_blocks + 1) * bytes_per_lcm_block
+```
+
+`+1` 表示每个 plane 都为 null parent 保留一段完整父块宽度。所有 plane 的完整区间
+首尾相接，最终总长度等于 `arena_bytes`。
+
+### 3. 复用 field 几何
+
+`CacheLayout.fields` 已经包含每个 field 的 `field_offset_bytes` 和
+`page_stride_bytes`。绑定容量不会改变一个 child page 内的布局，因此
+`CacheMemoryPlan.fields` 直接复用这组 immutable field layout。
+
+换句话说：
+
+```text
+CacheLayout 决定一个父块内部怎么切；
+CacheMemoryPlan 决定把这种父块重复多少次以及各 plane 放在哪里。
+```
+
+## 查询 API
+
+Plan 提供三个按 id 进行线性查找的方法：
+
+```python
+plan.group(group_id)   # -> CacheGroupLayout
+plan.plane(plane_id)   # -> CachePlaneLayout
+plan.field(field_id)   # -> CacheFieldLayout
+```
+
+找不到对应 id 时均抛出 `KeyError`。这些方法让调用方不需要依赖 tuple 的排列顺序：
+
+- `CachePool.field()` 先用 `field()` 找字段，再用 `group()` 和 `plane()` 定位存储；
+- runtime contract 用 `group()` 对齐 scheduler group 与物理 page count；
+- 清零、PD 和 Host L2 transfer 根据 field/group/plane 查询生成字节区间。
+
+Plan 不缓存字典索引。字段和 group 数量主要随模型层数增长，初始化与传输路径更看重
+简单、不可变和易序列化的表示；高频 attention kernel 不会在每个 token 上调用这些
+Python 查询方法。
+
+## Field 的实际字节地址
+
+`CacheFieldLayout` 给出了相对几何，`CachePool` 使用下面的公式计算某个 field、某个
+逻辑 block 的 arena byte offset：
+
+```text
+byte_offset(field, block_id) =
+    plane.arena_offset_bytes
+    + plane.bytes_per_lcm_block
+    - field.page_stride_bytes
+    + block_id * field.page_stride_bytes
+    + field.field_offset_bytes
+```
+
+其中：
+
+- `plane.arena_offset_bytes` 定位物理 plane；
+- `field.page_stride_bytes` 把逻辑 block id 转成 child-page 位移；
+- `field.field_offset_bytes` 定位 page 内的具体字段；
+- `plane.bytes_per_lcm_block - page_stride_bytes` 是 null page 的特殊偏移。
+
+### 为什么 page 0 位于 null parent 的最后一个 child slot
+
+假设某 plane 每个父块 8 字节，某 group 的 packing 为 4，因此 page stride 为 2
+字节。它的布局是：
+
+```text
+null parent                     usable parent 0
+┌────┬────┬────┬────┐          ┌────┬────┬────┬────┐
+│空  │空  │空  │p0  │          │p1  │p2  │p3  │p4  │
+└────┴────┴────┴────┘          └────┴────┴────┴────┘
+ 0    2    4    6               8   10   12   14
+```
+
+代入公式：
+
+```text
+block 0 offset = 8 - 2 + 0 × 2 = 6
+block 1 offset = 8 - 2 + 1 × 2 = 8
+block 4 offset = 8 - 2 + 4 × 2 = 14
+```
+
+因此每个 group 只暴露一个统一的 null page 0，而不是暴露 `packing` 个 null child
+page；可用 page 1 则恰好从第一个可用父块开始。即便不同 group 的 packing 不同，它们
+的 page 0 都落在各自解释下 null parent 的最后一个 child slot。
+
+## `arena_bytes` 与不同容量概念
+
+`arena_bytes` 是属性，不是存储字段：
+
+```python
+@property
+def arena_bytes(self) -> int:
+    return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
+```
+
+几个容易混淆的容量如下：
+
+| 名称 | 单位 | 是否包含 null | 含义 |
+| --- | --- | --- | --- |
+| `num_lcm_blocks` | parent blocks | 否 | 可用于真实请求的父块数量。 |
+| `group.page_count` | child pages | 是，包含 page 0 | 某个 group 的逻辑 page-id 上界。 |
+| `arena_bytes` | bytes | 是，包含 null parent | `CachePool` 实际分配的字节数。 |
+| `CachePoolSpec.pool_size` | token slots | 否 | 最大 packing group 对应的物理 token 槽位数。 |
+| `CachePoolSpec.token_capacity` | tokens | 否 | Scheduler 考虑并发和多 group 压力后的安全准入容量。 |
+
+特别需要注意：`arena_bytes` 不能用 `pool_size * dtype.itemsize` 推导。Arena 可以包含
+多个 plane、不同 element size、padding 和 overlay view，唯一权威值就是 plan 的
+`arena_bytes`。
+
+## `capacity_report()`：按 group 解释容量
+
+多 group cache 无法只用一个 token 数准确描述容量：
+
+- full-history group 按历史 token 持续增长；
+- sliding-window group 的单请求驻留量受 window 限制；
+- KDA/Mamba state group 更接近“每请求固定占几个 block”。
+
+`capacity_report()` 因此按每个 group 自己的消费单位返回诊断信息：
+
+```python
+report = plan.capacity_report(
+    window_tokens={"swa": 4096},
+    per_request_blocks={"state": 2},
+    max_num_seqs=32,
+)
+```
+
+返回值形式为：
+
+```python
+{
+    "group_id": {
+        "unit": "tokens" | "requests",
+        "capacity": int,
+        "supported_requests": int | None,
+        "dead_bytes": int | None,
+        "binding_utilization": float,
+    }
+}
+```
+
+### 普通 full-history group
+
+可用 page 数和 token 容量为：
+
+```text
+usable_pages = num_lcm_blocks * packing
+token_capacity = usable_pages * logical_block_tokens
+```
+
+由于每个请求的上下文长度未知，`supported_requests` 为 `None`；该诊断不把未使用的
+历史容量视为静态 dead bytes。
+
+### Sliding-window group
+
+传入 `window_tokens[group_id]` 后：
+
+```text
+supported_requests = token_capacity // window_tokens
+```
+
+如果还提供 `max_num_seqs`，超过 `max_num_seqs * window_tokens` 的静态 slab 容量无法
+被活跃 window 使用，报告会按该 group 的 field payload 估算 `dead_bytes`。
+
+### Per-request state group
+
+传入 `per_request_blocks[group_id]` 后，容量单位变为 requests：
+
+```text
+supported_requests = usable_pages // blocks_per_request
+```
+
+提供 `max_num_seqs` 时，超过请求上限的 state page 同样会计入 `dead_bytes`。
+
+### `binding_utilization`
+
+每个 group 的 binding utilization 为：
+
+```text
+packing * sum(group field payload bytes) / lcm_block_bytes
+```
+
+它表示“把这个 group 绑定到一个共享父块时，实际 payload 占整个父块的比例”。共享
+plane 按最宽 tenant 定尺寸，较窄 tenant 会留下 binding hole，因此该值可以用于发现
+LCM overlay 带来的静态浪费。Registry 也会把它写入 cache geometry 诊断信息。
+
+`capacity_report()` 是规划与诊断工具，不改变 plan，也不决定 scheduler 的最终
+`token_capacity`；后者由具体模型 recipe 结合请求并发、调度 batch 和 state pressure
+单独计算。
+
+## 下游如何消费 Plan
+
+同一份 `CacheMemoryPlan` 被多个运行时组件复用：
+
+```text
+CachePool
+├── arena_bytes                         分配 uint8 buffer
+├── field/group/plane                   建立 Tensor view
+├── group.page_count                    发布 runtime contract
+├── field/plane offset                  按 page 清零
+├── fields + runtime dtype              构建 PD contract
+└── planes/fields/groups                构建 Host L2 transfer layout
+```
+
+这种共享避免不同路径分别推导 offset。只要 recipe 生成的 plan 一致，计算、调度、清零
+和传输看到的就是同一套物理几何。
+
+## 关键不变量与常见误区
+
+### Plan 是纯整数几何
+
+Plan 只记录 `element_size`，不保存 `torch.dtype`。实际 dtype 由具体 pool 在调用
+`field(field_id, dtype)` 时提供，且 `dtype.itemsize` 必须等于 plan 的
+`element_size`。
+
+### `num_lcm_blocks` 不包含 null parent
+
+总 arena 使用 `num_lcm_blocks + 1`，但可用 group page 数只由
+`num_lcm_blocks * packing` 贡献，额外再加唯一的 page 0。
+
+### Group 不保存 retention
+
+`CacheGroupLayout` 只保存 group id、packing 和 page count。Retention、sliding
+window、history/state family 等 scheduler 语义位于 `PagedCacheGroupSpec`，两者在
+`CachePool` 发布 runtime contract 时按 group id 对齐。
+
+### Plane overlay 不是字段相加
+
+共享同一 plane 的不同 group 是对同一字节区域的不同解释。Plane 宽度由最宽 binding
+和对齐约束决定，不是把所有 group payload 简单相加。
+
+### `page_stride_bytes` 可以大于 payload
+
+允许 runtime stride 的 field 可以因为 plane 对齐或其他 tenant 更宽而带 padding；
+只有 `CacheFieldSpec.exact_page_stride=True` 的 field 才要求两者严格相等。
+
+### 应从 `CacheLayout` 生成生产 Plan
+
+`CacheMemoryPlan` dataclass 自身没有 `__post_init__()` 去重新验证任意手工参数。生产
+代码应当使用经过 `solve_cache_layout()` 校验的 `CacheLayout`，再调用
+`with_num_lcm_blocks()`，不要手工拼接可能互相矛盾的 groups、planes 和 fields。
