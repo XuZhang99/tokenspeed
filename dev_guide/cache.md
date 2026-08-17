@@ -34,6 +34,7 @@ CacheMemoryPlan                     # 容量绑定、dtype 完整
 | [Arena 与字段绑定](cache/field-binding.md) | eager allocation、`as_strided` view、token-row 折叠和 layer-plane 绑定。 |
 | [运行时集成](cache/runtime.md) | scheduler contract、target/draft 共享、清零、PD 与 Host L2。 |
 | [Pool 子类](cache/pools/README.md) | MHA、MLA、DSA、MSA、hybrid、Inkling、KDA 和 DeepSeek V4。 |
+| [Qwen3.5 LCM Cache](qwen35-lcm-cache.md) | full attention + GDN 的分组、packing、调度、state 双索引和 MTP。 |
 
 术语约定见 [KV Cache 管理机制](kvcache-management.md)，LCM 数学与扩展 recipe 的
 方法见 [LCM 两级分配](lcm.md)。英文的逻辑/物理分层规范以

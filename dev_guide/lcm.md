@@ -170,6 +170,8 @@ ShortConv ring。
 [`recipes/qwen35.py`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/qwen35.py)
 将重复的 linear layer position 拆成 state group，attention layer 声明 K/V，state
 layer 声明 conv/ssm。ReplaySSM 与普通 state 的 workspace/shape 差异由 recipe 处理。
+模型层分组、packing、scheduler 生命周期、state 双索引和 MTP commit 的完整调用链见
+[Qwen3.5 混合注意力的 LCM Cache 管理](qwen35-lcm-cache.md)。
 
 ## 6. Arena、Pool 与 scheduler
 

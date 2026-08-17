@@ -85,7 +85,7 @@ window 与 PD transfer policy。物理 packing/page count 在 `CacheMemoryPlan`�
 | MLA | `MLATokenToKVPool` | latent，或 latent/scale/rope |
 | DSA | `DSATokenToKVPool` | MLA + block-split index-K |
 | MSA | `MSATokenToKVPool` | MHA + sparse index-K |
-| Qwen GDN | `HybridMHATokenToKVPool` | MHA history + conv/ssm |
+| [Qwen GDN](qwen35-lcm-cache.md) | `HybridMHATokenToKVPool` | MHA history + conv/ssm |
 | Inkling | `HybridInklingTokenToKVPool` | MHA + ShortConv checkpoints |
 | Kimi K3 | `HybridKDATokenToKVPool` | MLA history + KDA state |
 | DeepSeek V4 | `HybridDeepseekV4TokenToKVPool` | SWA/compressed/state/indexer |
