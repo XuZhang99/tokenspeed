@@ -1,139 +1,35 @@
 # DSATokenToKVPool
 
-[子类索引](README.md) · [父类：MLATokenToKVPool](mla.md)
+[子类索引](README.md) · [父类：MLA](mla.md)
 
 源码：[`kv_cache/dsa.py`](../../../python/tokenspeed/runtime/layers/attention/kv_cache/dsa.py)
 
-## 定位与创建条件
+`DSATokenToKVPool` 在 MLA latent cache 上增加每层 `index_k`。factory 对
+`DSAConfig` 优先选择该类。
 
-`DSATokenToKVPool` 继承 `MLATokenToKVPool`，在 MLA latent cache 之外增加 DSA
-稀疏检索使用的 index-K：
+## index-K 物理格式
 
-```text
-CachePool
-└── MLATokenToKVPool
-    └── DSATokenToKVPool
-```
-
-Factory 在 `config` 是 `DSAConfig` 时优先选择该类，并从 config 传入
-`index_head_dim`。MLA 的 latent/nope/rope 读写全部由父类提供。
-
-## 新增字段
-
-每层额外绑定：
+Recipe 声明：
 
 ```text
-layer.<id>.index_k
+layer.<id>.index_k [P, dsa_index_k_row_bytes(index_head_dim)] uint8
 ```
 
-运行时底层 view 为：
+每个 page 的 raw bytes 采用 block-split 格式：先连续存所有 FP8 key，再连续存
+float32 scale；它不是逐 token 的 `[FP8 | scale]` 交错行。
 
-```text
-index_k_buffer[layer].shape = [num_slots, index_k_row_bytes]
-dtype = uint8
-```
+`set_index_k_buffer()` 对输入做 `group_size=128` 的 token-group FP8 量化，然后调用
+`index_k_block_split_scatter()`。kernel 使用 `arena.kv_page_size` 把 flat loc 分解为
+page 与 page 内 offset。
 
-每个 token 的逻辑行包含：
+`get_index_k_buffer()` 返回 raw planned field；需要连续 `(values, scales)` 的 consumer
+必须使用与 block-split 格式匹配的 gather 路径，不能把 raw row 当交错结构读取。
 
-```text
-index_head_dim 个 FP8 值
-+ index_head_dim / 128 个 FP32 scale
-```
+`get_kv_size_bytes()` 在父类 MLA 统计上增加 index-K view 的字节数。
 
-因此：
+## 不变量
 
-```text
-index_k_row_bytes =
-    index_head_dim
-    + (index_head_dim / 128) * sizeof(float32)
-```
-
-## 为什么采用 page 内 block-split
-
-DeepGEMM 的 `fp8_paged_mqa_logits` 期望一个 page 内先连续存放所有 FP8 key，
-然后连续存放所有 scale：
-
-```text
-一个 page
-├── [page_size, index_head_dim] FP8 values
-└── [page_size, num_groups]     FP32 scales
-```
-
-而不是逐 token 交错成：
-
-```text
-token 0 [FP8 | scale], token 1 [FP8 | scale], ...
-```
-
-`_index_k_block_views()` 在同一个 `uint8` storage 上建立两个 `as_strided` view：
-
-```text
-fp8_view:   [num_pages, page_size, index_head_dim]
-scale_view: [num_pages, page_size, index_head_dim / 128]
-```
-
-二者不复制数据，写入会直接落到原始 `index_k_buffer`。
-
-## 写入路径
-
-`set_index_k_buffer(layer_id, loc, index_k)`：
-
-1. 将输入转换为 `model_dtype`；
-2. reshape 为 `[num_tokens, index_head_dim]`；
-3. 以 `group_size=128` 做 per-token-group FP8 量化；
-4. 得到 `float8_e4m3fn` values 和 FP32 scale；
-5. 调用 `index_k_block_split_scatter()`，在 kernel 内由 flat `loc` 算出
-   `(page, offset_in_page)` 并写入 block-split 布局。
-
-量化 granularity 和 scale encoding 是固定 contract，不能由调用方任意改变。
-
-## Gather 路径
-
-非分页 prefill scoring kernel 需要连续的 `(k_fp8, k_scale)`。因此：
-
-```python
-gather_index_k(layer_id, slots)
-```
-
-先把 flat slot 转为：
-
-```text
-page = slot // page_size
-offset = slot % page_size
-```
-
-再从两个 block-split view 收集：
-
-```text
-k_fp8:  [num_slots, index_head_dim]
-k_scale:[num_slots, index_head_dim / 128]
-```
-
-直接按原始 `[slot, row_bytes]` 索引会把 page 内分开的 value/scale 错当成逐 token
-交错布局，因此必须使用该接口。
-
-## 与 MLA 接口的组合
-
-DSA layer 同时具有：
-
-- 父类的 `latent_kv`，或量化模式下的 latent/scale/rope 三元组；
-- 本类的 `index_k`。
-
-`has_index_k_buffer()` 固定返回 `True`，backend 可据此选择 DSA scoring 路径。
-`get_index_k_buffer()` 也遵循 layer-wise load tracker 的同步约定。
-
-## 统计与传输
-
-- `get_kv_size_bytes()` 在父类 latent cache 字节上加上全部 index-K；
-- `get_contiguous_buf_infos()` 在父类 buffer 列表后追加每层 index-K 的 pointer、
-  总字节数和 page item bytes；
-- `get_layerwise_buf_info_offsets()` 为每层追加 index-K 条目，父类普通模式从
-  `layer_num` 后开始，per-token-head 模式从 `3 * layer_num` 后开始。
-
-## 关键不变量
-
-- `index_head_dim` 应按 128 分组；
-- index-K 的 runtime dtype 固定为 `uint8` raw storage；
-- page 内格式是 block-split，不是 token-interleaved；
-- scatter 与 gather 必须使用相同的 `page_size`、head dim 和 group size；
-- DSA 的 latent cache 行为仍以父类 MLA 文档为准。
+- `index_head_dim` 按 128 分组；
+- index field dtype 固定为 `uint8` raw storage；
+- scatter/gather 必须共享相同 P、head dim 与 group size；
+- latent/nope/rope 行为仍以 MLA 父类为准。

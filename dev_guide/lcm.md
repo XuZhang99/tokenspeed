@@ -1,407 +1,219 @@
-# LCM 两级 KV-Cache 分配机制
+# LCM 两级 Cache 分配机制
 
-[Jenga: Effective Memory Management for Serving LLM with Heterogeneity](https://dl.acm.org/doi/10.1145/3731569.3764823)
+本文说明当前 cache planner 如何把不同 group 的 CacheBlock 打包进统一 parent。对象
+级细节见 [Cache 开发文档](cache.md)，逻辑/物理命名规范见
+[`docs/design/cache-concepts.md`](../docs/design/cache-concepts.md)。
 
-##### commit-id: 638b9de0e698446b5e50a2a9508778b2f59473f6
+## 1. 为什么需要 LCM parent
 
-本文详细讲解 TokenSpeed 中 **LCM（two-level）KV-cache 分配体系**——一块共享物理
-arena + 两级打包的 KV 内存布局与分配机制。它最初由 PR #804（`jenga two level
-allocation`）引入，后经 PR #949（`Refactor/kv cache spec single source`）等重构，
-从早期散落的 `configs/lcm_*.py` + `kv_cache/lcm*.py` 文件统一迁入
-`python/tokenspeed/runtime/layers/attention/kv_cache/recipes/` 这个 **cache recipe**
-包，术语也从 `Lcm*` 前缀改成中性的 `CacheLayout` / `CacheMemoryPlan` / `CachePool`。
-**LCM 算法本身逐字未变**（`_solve_packing` / `_check_exact_page_strides` /
-`exact_page_stride` / parent LCM 对齐循环都还在），而且现在是**唯一**的 KV-cache
-分配路径——不再有 radix / flat-slab 旧体系可选。本文可独立阅读，是
-`kvcache-management.md` 第 4 节的完整展开。
+混合模型的 cache 单位并不等宽：
 
----
+- MHA/MLA history 是逐 token row；
+- sliding window 只保留有限历史；
+- recurrent/conv state 每隔若干 token 保存 snapshot；
+- Kimi K3 的 MLA 与 KDA state、DeepSeek V4 的压缩链有不同 payload；
+- MXFP8 还包含独立 scale plane。
 
-## 1. LCM 是什么，解决什么问题
+若为每组预留独立大池，某些 group 会因为 per-request state 或 window 上限留下大量
+静态空洞。LCM 布局将若干 group 的 child CacheBlock 打包到一个字节统一的 parent：
 
-### 1.1 背景：异构 cache 的对齐难题
+```text
+LCM parent
+├─ plane 0：group A × K_A child blocks
+├─ plane 1：group B × K_B child blocks
+└─ ...
+```
 
-传统 attention 模型每个 token 只有一种 KV：K/V 两块张量，按 page 分配即可。但
-hybrid 模型一层可能是 **full-attention**（存 history K/V 或 MLA latent），另一层是
-**linear-attention**（存 recurrent state + conv state），甚至还叠加 draft 模型的
-history、Inkling 的 ShortConv checkpoint 等。这些 cache：
+同一 parent 在 allocator 中一次只归一个 group 所有；不同 group 的 Tensor view 可以
+overlay 同一字节几何，但不会把两组 live data 同时写到同一 parent。
 
-- **每 token 的字节数天差地别**：一段 recurrent state 是「每个 sequence 一份、和
-  序列长度无关」的定长快照，而 history K/V 是「每 token 一行」线性增长。
-- **kernel 对 stride 的假设不同**：有的 kernel 按隐式 payload-sized stride 走页
-  （必须精确），有的 kernel 在 launch 时读取运行时 `stride(0)`（可吸收 slack）。
+## 2. 三类粒度
 
-如果给每种 cache 单独开一块 pool，会碰到两个问题：(1) 内存被切成多块，碎片化、
-利用率低；(2) 调度器要同时管理多套 page 表、多套容量约束，复杂且易错。
+必须区分：
 
-### 1.2 LCM 的方案：一块 arena + 两级打包
+| 名称 | 单位 | 所有者 |
+| --- | --- | --- |
+| `prefix_granularity`（P） | token | prefix identity / memory plan |
+| `block_granularity` | token | 每个 `CacheGroupSpec` |
+| `cache_blocks_per_lcm_block` | child blocks / parent | `CacheLayout` / `CacheMemoryPlan` |
 
-LCM 把所有这些异构 cache 打包进 **一块 budget 大小的连续物理 arena**，用单一
-`cache_budget_bytes` 精确推导整个几何。核心思想是**两级（two-level）**：
+row group 的 `block_granularity = rows_per_page × entry_stride_tokens`；snapshot state
+group 的 `block_granularity = checkpoint_granularity`。kernel 的 `kernel_page_size` 是
+第四个独立概念，来自 backend registry，不属于 scheduler 或 LCM packing。
 
-- **上层单位 = parent LCM block**：arena 被切成 `num_lcm_blocks` 个等大的 parent
-  block，parent 是调度器**唯一**的分配/驱逐/调度单位，固定容纳
-  `logical_block_tokens` 个逻辑 token。该值现在是**每个 recipe 自选的参数**（不再是
-  全局常量）：GDN / Inkling 用 128（`recipes/qwen35.py:132`、`recipes/inkling.py:237`），
-  Kimi-K3 用 `_KIMI_K3_LOGICAL_BLOCK_TOKENS`（`recipes/kimi_k3.py`），DeepSeek-V4 用
-  256（`recipes/deepseek_v4.py:24`）。
-- **下层单位 = per-group child page**：每个 cache group 在一个 parent 里按各自的
-  **packing 因子 `cache_blocks_per_lcm_block`** 容纳固定整数个子 page。
+## 3. 唯一流水线
 
-分配**一个 parent** 就同时为**所有** group（history KV、recurrent/conv state、
-draft history…）预留好各自数量的 page——调度器只需管理 parent 一个维度的整数，
-每个 group 的物理页号由 parent id 乘以该 group 的 packing 因子直接算出。
+[`recipes/base.py`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/base.py)
+中的 `CacheRecipe.setup()` 声明唯一顺序：
 
-### 1.3 名字由来："LCM" = 最小公倍数对齐
+```text
+layers ──group──▶ declarations ──pack──▶ CacheLayout ──bind──▶ CacheMemoryPlan
+```
 
-parent block 的字节大小必须能被**每个 group 的 packing 因子整除**（这样才能把
-parent 均匀切成整数个 child page）。规划器通过对所有 packing 因子求
-**最小公倍数（Least Common Multiple）**来定 parent 的对齐
-（`recipes/plan.py:637`-`640`，在 `solve_cache_layout` 内）：
+### 3.1 layers
+
+recipe 提供 target 后接 draft continuation 的：
+
+- `layer_types`：attention/state label；
+- `group_ids`：每层落在哪个物理 group。
+
+普通 family 用默认 `groups()`；Inkling 和 DeepSeek V4 因为有非 per-layer group，覆盖
+该 seam。
+
+### 3.2 group
+
+[`recipes/spec.py::group()`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/spec.py)
+一次遍历同时生成每个 group 的逻辑 spec 与 field 列表：
+
+```text
+(CacheGroupSpec, CacheFieldSpec[])[]
+```
+
+group id 只写在 spec 中，field 通过外层 pair 归属；同一批 pair 同时交给 planner 和
+runtime contract，消除了两份 group 枚举不一致的可能。
+
+### 3.3 pack
+
+[`recipes/plan.py::pack()`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/plan.py)
+求一个 parent 的容量无关 `CacheLayout`：
+
+- 每个 group 的 packing；
+- 每个 plane 的 parent 宽度；
+- field 在 plane 内的 offset 与 page stride；
+- 总 `lcm_block_bytes`。
+
+`CacheFieldSpec.exact_page_stride=True` 的字段要求 stride 恰好等于 payload；柔性字段
+可以使用 padding，但 kernel 必须读取 runtime stride。planner 同时校验 alignment 与
+`max_padding_fraction`。
+
+### 3.4 bind
+
+family 根据显存预算与并发求出 parent 数，然后：
 
 ```python
-parent_alignment = alignment
-for count in packing.values():
-    parent_alignment = parent_alignment // math.gcd(parent_alignment, count) * count
-lcm_block_bytes = _align_up(sum(plane_bytes.values()), parent_alignment)
+plan = layout.bind(num_lcm_blocks)
 ```
 
-即 `parent_alignment = lcm(alignment, *packing.values())`。这个 LCM 对齐正是整个
-体系名字的来源。hybrid recipe 传入的 `alignment=256`（`recipes/ordinary.py:252`）。
+生成：
 
-> **旧体系已删除**：flat-slab 时代（`flat_hybrid.py` / `flat_state_slabs.py` /
-> `hybrid_cache_plan.py` / `flat_memory_plan.py`）以及 radix / flat 双后端都已被
-> 无条件的两级 cache 取代。**当前 LCM 是唯一路径**：没有匹配 recipe 的模型会在
-> `create_attn_components` 直接 raise（`registry.py:860`-`864`）。
-
----
-
-## 2. 核心概念与术语
-
-| 术语 | 含义 |
-|---|---|
-| **parent LCM block** | arena 的分配/调度单位，固定 `logical_block_tokens` 逻辑 token。共 `num_lcm_blocks` 个（不含 null）。 |
-| **cache group** | 一组共享同一 retention/packing 的层的集合，如 `full_attention` / `linear_attention` / `kvconv` / `hiddenconv`。 |
-| **packing 因子** | `cache_blocks_per_lcm_block`，一个 parent 里某 group 塞几个 child page。 |
-| **child page / cache block** | group 的最小物理页；一个 parent 里某 group 有 `packing` 个。 |
-| **plane** | arena 内的一段连续区域，同一 plane 被多个 group 的同名 field **overlay**（错位复用）共享。plane-major 布局。 |
-| **field** | 一个具体张量视图的几何描述（layer 的 k / v / latent_kv / conv_state 等），归属某 group + 某 plane。 |
-| **null LCM block（parent 0）** | 永不调度的哨兵 parent，backing 逻辑 null page 0。`arena_bytes` 含它，`num_lcm_blocks` 不含。 |
-| **logical_block_tokens** | 逻辑页 token 数，per-recipe 参数（GDN/Inkling 128、DSV4 256）。 |
-
-**两级映射直觉**：某 group（packing = K）的 child page 号 = `parent_id * K + slot`
-（slot ∈ [0, K)）；每组 `page_count = 1 + num_lcm_blocks * K`（`recipes/plan.py:251`
-一带的 `with_num_lcm_blocks`，`1 +` 是 null parent 的哨兵页）。
-
----
-
-## 3. 几何层 `recipes/plan.py`
-
-`python/tokenspeed/runtime/layers/attention/kv_cache/recipes/plan.py`——**纯整数几何，
-不 import torch**（模块 docstring：*"Pure integer geometry for one shared LCM cache
-arena."*）。它只负责回答「arena 有多大、每个 field 落在哪个字节偏移、page stride
-多少」。这是整个体系的核心，所有 LCM/packing 数学都集中在这一个文件里。
-
-### 3.1 数据类
-
-- `CacheGroupLayout`（`:38`）：per-group 结果——`group_id` +
-  `cache_blocks_per_lcm_block`（packing）+ `page_count`。
-- `CachePlaneLayout`（`:45`）：`plane_id` + `bytes_per_lcm_block` + `arena_offset_bytes`。
-- `CacheFieldLayout`（`:52`）：**输出**——solved 后的 field 放置：`plane_id` /
-  `shape` / `element_size` / `field_offset_bytes` / `page_stride_bytes`
-  （`.payload_bytes` 在 `:62`）。
-- `CacheMemoryPlan`（`:67`）：**容量绑定**的最终产物（旧 `LcmMemoryPlan`），含
-  `logical_block_tokens` / `lcm_block_bytes` / `num_lcm_blocks` / `groups` / `planes`
-  / `fields`；`arena_bytes`（`:81`，`= (num_lcm_blocks + 1) * lcm_block_bytes`，`+1` 是
-  null parent）、`group()`/`field()`/`plane()` 查询（`:84`-`100`）、`capacity_report()`
-  （`:102`，per-group dead-bytes / binding-utilization 诊断）。
-- `CacheFieldSpec`（`:198`）：**输入**配方——`group_id` / `field_id` / `plane_id` /
-  `shape` / `element_size`，外加 `exact_page_stride: bool = True`（`:206`）和
-  `page_stride_alignment_bytes: int = 1`（`:210`）。`.payload_bytes` 在 `:213`。
-- `CacheLayout`（`:218`）：**容量无关**的单 parent 字节几何（`lcm_block_bytes` /
-  `group_packing` / `plane_bytes` / `fields`）。`with_num_lcm_blocks(n)`（`:227`）把它
-  变成一个 `CacheMemoryPlan`（每组 `page_count = 1 + n*count`，plane
-  `arena_offset_bytes` 累加）。**Layout↔Plan 的这个拆分是新的**：几何先算一次（与容量
-  无关），再乘上 `num_lcm_blocks` 得到容量绑定的 plan。
-
-### 3.2 `exact_page_stride`：两类 kernel
-
-`CacheFieldSpec.exact_page_stride`（`:206`）区分 field 的 kernel 对 stride 的假设：
-
-- `True`（默认）：kernel 按**隐式 payload-sized stride** 走页——page stride 必须
-  精确等于 `payload_bytes`，否则读错行。history K/V、MLA latent、scale field 属此类。
-- `False`：kernel 在 launch 时读取运行时 `stride(0)`，可以吸收其它 field 在 plane
-  里留下的 slack。conv/ssm state、Inkling 的 kvconv/hiddenconv 属此类
-  （`recipes/inkling.py:89`/`:97`/`:105` 均设 `exact_page_stride=False`）。
-
-### 3.3 求解入口 `solve_cache_layout(...)`（`:457`）
-
-旧 `plan_lcm_fields` 的直接后继。签名：`solve_cache_layout(fields, *,
-logical_block_tokens, cache_blocks_per_lcm_block=None, alignment=1,
-max_padding_fraction=0.25) -> CacheLayout`。规划一个 **plane-major** arena，field 在
-cache group 之间 overlay。关键行为：
-
-1. **packing 推导**：
-   - `_solve_packing`（`:363`）：对**同一 plane 上 exact 字节**建立 group 间比例
-     约束（并查集 + 分数化简），推出让各 group page stride 精确一致的整数 packing。
-   - `_packing_by_group_ratio`（`:425`）：fallback，按 `largest_payload //
-     group_payload` 给比例。
-   - 显式 `cache_blocks_per_lcm_block` 覆盖以上（供 draft 复用 target 几何，或
-     `_ordinary_setup` 强制 packing=1）。
-2. **plane / parent 字节**：`plane_bytes` 逐 plane 对齐；`lcm_block_bytes` 对所有
-   packing 求 LCM 对齐（`:637`-`640`，见 §1.3）。
-3. **校验（fail loud）**：
-   - `_check_exact_page_strides`（`:433`，调用点 `:635`）：exact field 的
-     `plane_bytes // packing` 必须 == `payload_bytes`，否则报错并提示是哪个 field 把
-     plane 撑大了。
-   - padding fraction ≤ `max_padding_fraction`（`:654`-`659`）。
-   - kernel page id 不超 `_MAX_KERNEL_PAGE_ID = 2^31 - 1`（`:34`，检查在
-     `with_num_lcm_blocks` 的 `:237`）；`lcm_block_bytes` 不超
-     `_MAX_LCM_BLOCK_BYTES = 2^63 - 1`（`:33`）。
-4. **draft 合并**：`merge_continuation_layers`（`:272`）把 draft 模型的 per-layer 向量
-   接在 target 之后（draft = 「一个大模型的后续层」）；`continue_layer_fields`（`:326`）
-   把 draft `layer.i` 用正则重编号成 `layer.{first+i}`。
-
-`_align_up(value, alignment)` 在 `:359`。
-
----
-
-## 4. 布局 recipe（各 model family）
-
-每个 model family 有一个 recipe 文件，把层结构翻译成一串 `CacheFieldSpec`，喂给
-`solve_cache_layout`。recipe 只**选 packing 策略**（exact-ratio / power-of-two /
-pinned）并造 field，真正的 LCM 求解都委托给 `plan.py`。
-
-### 4.1 `recipes/ordinary.py`——MHA / MLA / DSA / MSA（最大的一次旧→新合并）
-
-- `mla_cache_fields`（`:15`）/ `mha_cache_fields`（`:42`，产 `layer.{i}.k/v` field +
-  mxfp8 scale field）/ `draft_cache_fields`（`:117`）。
-- `build_hybrid_cache_setup`（`:216`）：LCM sizing 驱动——调
-  `solve_cache_layout(alignment=256)`（`:252`），`num_lcm_blocks = usable_cache_bytes
-  // lcm_block_bytes - 1`（`:261`，`-1` 是 null parent），再套 token 上限，返回
-  `CacheSetup`。被 inkling + qwen35 复用。
-- `_ordinary_setup`（`:343`）：profiled-bytes 路径，强制 packing=1（`cache_blocks_per
-  _lcm_block={gid:1}`、`alignment=1`），供 mha/mla/dsa/msa 单一 group 使用。
-- `prepare_ordinary_cache(*, family, ...)`（`:510`）：旧 `_prepare_mha` 的后继，
-  按 config 类型分派 `_mha_fields`（`:471`）/ `_mla_fields`（`:552`）等。
-
-### 4.2 `recipes/kimi_k3.py`——Kimi-K3（MLA + KDA）
-
-- `solve_kimi_k3_cache_layout`（`:235`）：把 `FULL_ATTENTION` packing 钉死为 12
-  （`_KIMI_K3_MLA_PACKING = 12`，`:29`），从 MLA plane 字节推导 KDA `linear_packing`
-  （`:264`-`278`），调 `solve_cache_layout(alignment=256)`，最后 assert 结果 packing
-  等于钉死值（`:288`）。draft MLA 层经 `continue_layer_fields` 接入。
-- `kimi_k3_token_capacity_for_cache_pool`（`:344`）：二分反推 token 容量。
-- `prepare_kimi_k3_cache`（`:388`）：旧 `_prepare_kimi_k3` 的后继。
-
-### 4.3 `recipes/deepseek_v4.py`——DeepSeek-V4
-
-- `solve_deepseek_v4_memory_layout`（`:77`）：用 **2 的幂** packing 而非 exact LCM
-  （`:85`-`86` 注释解释 exact 比例会因巨大 LCM「撑爆 parent」），仍调
-  `solve_cache_layout(alignment=256)`。
-- `prepare_deepseek_v4_cache`（`:199`）。byte-formula 与 spec builder 在
-  `recipes/deepseek_v4_cache_spec.py`（`DeepseekV4CacheLayout`:155、
-  `deepseek_v4_cache_layout_from_config`:210、`build_v4_cache_specs`:318）。
-
-### 4.4 `recipes/inkling.py` / `recipes/qwen35.py`——hybrid state 家族
-
-- `inkling.py`：`inkling_cache_fields`（`:14`，KV plane + `kvconv`/`hiddenconv` state
-  field，均 `exact_page_stride=False`），`prepare_inkling_cache`（`:225`）委托
-  `build_hybrid_cache_setup`。
-- `qwen35.py`：`qwen_gdn_cache_fields`（`:41`，full-attn history + GDN recurrent
-  state），`prepare_qwen35_cache`（`:109`）委托 `build_hybrid_cache_setup`。
-
----
-
-## 5. 调度器接口 `recipes/spec.py` + `recipes/cache_runtime.py`
-
-`solve_cache_layout` 产出的是 arena 字节几何；scheduler 需要的是**每组多少页**。这两
-个文件把几何翻译成调度器契约。
-
-### 5.1 `recipes/spec.py`——group spec 与页数
-
-- `PagedCacheGroupSpec`（`:29`）：调度器契约单位——`group_id` / `retention`
-  （`full_history` / `sliding_window`）/ `rows_per_page` / `entry_stride_tokens` /
-  `sliding_window_tokens` / `family`（`history` / `state`）/
-  `cache_blocks_per_lcm_block`（`:38`，surface 给调度器的 packing 因子）/
-  `transfer_policy`。
-- `validate_scheduler_config`（`:64`）：每个 pool 必须从 recipe 发布一个
-  `runtime_contract`，否则 raise。
-- `compute_paged_cache_group_page_counts`（`:105`）：per-group child-page 数
-  （history / state / sliding 各自公式）。
-- `build_paged_cache_group_specs`（`:593`）、`group_specs_from_layer_types`（`:474`）、
-  `apply_pd_transfer_policies`（`:572`）等辅助。
-
-### 5.2 `recipes/cache_runtime.py`——发布出去的运行时契约
-
-- `PagedCacheRuntimeContract`（`:57`）：`block_size` / `num_lcm_blocks` /
-  `token_capacity` / `group_specs` / `group_page_counts`。`__post_init__`（`:64`）强制
-  `group_page_counts == num_lcm_blocks * cache_blocks_per_lcm_block + 1`（per group）——
-  这正是把调度器的 page id 绑到 LCM plan 的不变式。
-
----
-
-## 6. Setup 编排 `recipes/setup.py`
-
-`python/tokenspeed/runtime/layers/attention/kv_cache/recipes/setup.py`——从
-`cache_budget_bytes` 同时给 target + draft arena 定尺寸的结果容器与 family 分派。
-
-### 6.1 产物数据类
-
-- `CacheModelFamily`（`:53`）：`Literal["mha", "mla", "dsa", "msa", "qwen_gdn",
-  "inkling", "kimi_k3", "deepseek_v4"]`。
-- `CachePoolSpec`（`:66`）：绑定一个 model 计算视图到 arena 所需的一切——`family` /
-  `memory_plan: CacheMemoryPlan` / `layer_types` / `layer_group_ids` /
-  `paged_cache_group_specs` / `state_field_dtypes` / `token_capacity` /
-  `pool_options`。`pool_size`（`:83`）= `num_lcm_blocks * max_packing *
-  logical_block_tokens`（child token 容量）；`layer_view(...)`（`:93`）为异构 draft 在
-  同一 arena 上切 per-layer 元数据。
-- `CacheSetup`（`:141`）：`spec` + `num_draft_layers` + `cache_budget_bytes` +
-  `fixed_workspace_bytes`。
-
-### 6.2 family→recipe 分派
-
-- `_PREPARE_CACHE`（`:163`）：**family→recipe 注册表**（替代旧的 `lcm_family` 字符串
-  判定）。mha/mla/dsa/msa → `partial(prepare_ordinary_cache, family=...)`；其余各自的
-  prepare 函数。
-- `prepare_cache_setup(*, family, ...)`（`:175`）：`create_attn_components` 调用的单一
-  分派入口，`_PREPARE_CACHE[family](...)` 运行对应 recipe 返回 `CacheSetup`。
-
----
-
-## 7. 物理存储 `kv_cache/base.py`（`CachePool`）
-
-`python/tokenspeed/runtime/layers/attention/kv_cache/base.py:45`（旧 `LcmCachePool`）
-——持有**一块** arena backing，按 plan 发 strided view。它是所有 KV pool 的物理底座。
-
-- **backing**（`:271`-`277`）：`torch.zeros(self.plan.arena_bytes, dtype=torch.uint8,
-  device=...)`——单块扁平 uint8，lazy 分配。
-- **`field(field_id, dtype)`（`:180`）**：核心。按 plan 用 `as_strided` 发某 field 的
-  strided view，起始偏移由 `_field_block_byte_offset`（`:279`）算（plane arena offset
-  + parent 内偏移 + field 偏移）。
-- **`_publish_runtime_contract`（`:139`）**：把每个 spec 的 `cache_blocks_per_lcm
-  _block` 对齐到 plan 的 group packing，构造 `PagedCacheRuntimeContract`（`:96`
-  一带调用）。
-- **`pd_contract(group_specs)`（`:242`）**：给 PD 构造跨节点传输 contract，委托
-  `runtime/pd/cache_protocol.py` 的 `build_lcm_pd_cache_contract`（`:244`/`:257`）。
-- **`cache_transfer_layout`（`:318`）**：给 host L2 transfer 用，委托
-  `runtime/cache/transfer/layout.py` 的 `layout_from_lcm_plan`。
-
-具体计算接口 pool 继承 `CachePool`，把 buffer 从「自己 malloc」改成「绑到共享 arena
-的 field view」，其余 attention ABI 不变：`kv_cache/mha.py`（`MHATokenToKVPool` /
-`MHATokenToKVPoolMXFP8`）、`kv_cache/mla.py`（`MLATokenToKVPool`）、`kv_cache/dsa.py`、
-`kv_cache/msa.py`、`kv_cache/hybrid_*.py`（Kimi-K3 KDA / Inkling / DeepSeek-V4 等
-hybrid 变体）。
-
----
-
-## 8. 与 registry / scheduler 集成
-
-### 8.1 哪些模型走哪个 recipe（`registry.py`）
-
-`create_attn_components`（`registry.py:763`）里由架构能力决定 `cache_family`
-（`:839`-`864`）：
-
-```python
-use_cache_gdn     = is_hybrid_gdn and has_state     # Qwen3.5 GDN → "qwen_gdn"
-use_cache_k3      = is_hybrid_mla_kda               # Kimi-K3 KDA → "kimi_k3"
-use_cache_inkling = is_inkling                      # Inkling ShortConv → "inkling"
-if is_deepseek_v4_model:  cache_family = "deepseek_v4"
-elif use_cache_gdn:       cache_family = "qwen_gdn"
-elif use_cache_k3:        cache_family = "kimi_k3"
-elif use_cache_inkling:   cache_family = "inkling"
-elif <MHAConfig>:         cache_family = "mha"
-elif <MLAConfig>:         cache_family = "mla"
-elif <DSAConfig>:         cache_family = "dsa"
-elif <MSAConfig>:         cache_family = "msa"
-else:                     cache_family = None        # → raise "No cache recipe ..."
+```text
+group.page_count = 1 + N × packing
+arena_bytes       = (N + 1) × lcm_block_bytes
 ```
 
-> 旧的 `lcm_family` 字符串已彻底移除；现在是 (a) `recipes/setup.py:163` 的
-> `_PREPARE_CACHE` 分派字典 + (b) 这段 `registry.py:839`-`864` 的 family 选择链。
+额外 parent/block 是 null placeholder。
 
-`cache_family` 定好后：`prepare_cache_setup`（`registry.py` 里调用，
-→ `recipes/setup.py:175`）跑 recipe 得 `CacheSetup`；`_validate_lcm_page_size`
-（`registry.py:258`）校验逻辑页是 kernel 页的整数倍；`factory.create_cache_pool`
-（`kv_cache/factory.py:12`）按 `spec.family` + config 类型造实际 pool。异构 draft
-经 `spec.layer_view(...)` 共享同一 arena/plan。
+## 4. `CacheRecipe` 扩展 seam
 
-### 8.2 scheduler 看到的几何
+新增或修改 family 时，优先覆盖以下统一 seam：
 
-scheduler 通过 pool 的 `runtime_contract`（`num_lcm_blocks` / `group_page_counts`）
-拿几何，由 `scheduler_utils.scheduler_cache_geometry_from_pool`（`:79`）翻译成
-`SchedulerCacheGeometry`（`:71`），再由 `pool_to_paged_cache_groups`（`:248`）转成
-C++ `PagedCacheGroupConfig` 列表喂给 `make_config`（`:198`）。调度器只在 parent
-维度上分配 page，各 group 物理页由 packing 因子换算。
+| seam | 作用 |
+| --- | --- |
+| `layer_types`, `group_ids` | layer vocabulary |
+| `fields_for_layer()` | 一个 layer 的 field bytes |
+| `groups()` | 只有非 per-layer group 才覆盖 |
+| `prefix_granularity`, `alignment`, `max_padding_fraction` | planner 参数 |
+| `packing()` | 钉死或调整 group packing |
+| `check_layout()` | pack 后、bind 前的 family invariant |
+| `num_lcm_blocks()` | 从预算求 parent 数 |
+| `parents_needed()`, `token_capacity()` | 非简单容量模型 |
+| `workspace_bytes()` | arena 之外的固定 workspace |
+| `pool_options()` | family-only runtime layout |
 
-### 8.3 新页清零流程
+子类应使用 `@override`；不要覆盖 `setup()` 并复制流水线。
 
-`model_executor.zero_cache_pages(pages)`（`execution/model_executor.py:1177`）在
-scheduler 发来「本步新拥有的页」（`execution_plan.pages_to_zero`）时被调，pool-agnostic
-地转发到 pool 的 `zero_new_pages`（Mapping）/ `zero_pages`（page-id 列表），清零后返回
-一个 CUDA completion event 供后续同步。（旧的 `zero_flat_cache_pages` 已被这条泛化
-路径取代。）
+## 5. Family 差异
 
----
+### Ordinary：MHA / MLA / DSA / MSA
 
-## 9. 端到端数值示例（示意）
+[`recipes/ordinary.py`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/ordinary.py)
+统一处理四类：
 
-以 Qwen3.5 GDN 为例，直觉上一次分配长这样：
+- 每组 packing 固定为 1；
+- parent span 等于 P；
+- parent 数从 profile 的 `cache_cell_size × storage_layers` 求得；
+- MHA 可附加 MXFP8 scale；MLA 可拆 latent/scale/rope；DSA/MSA 附加 index-K。
 
+hybrid slab 的实际 storage layer 数由 `hybrid_slab_group_size()` 统一决定，避免 profile
+与 planner 使用不同 divisor。
+
+### Kimi K3
+
+[`recipes/kimi_k3.py`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/kimi_k3.py)
+把 full-attention packing 固定为 12，并用 MLA plane 字节宽度推导三个 KDA state
+group 的 packing。`check_layout()` 要求 KDA 完全骑在 MLA plane 内，不产生额外 plane。
+
+K3 的 state working set 与 history demand 不符合简单乘积，因此覆盖
+`parents_needed()`，再用基类 `_capacity_from_parents()` 的单调二分反推 admission
+capacity。
+
+### DeepSeek V4
+
+[`recipes/deepseek_v4.py`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/deepseek_v4.py)
+整体声明 SWA、compressed KV、compressor state 和 indexer group。kernel byte geometry
+来自
+[`deepseek_v4_geometry.py`](../python/tokenspeed/runtime/layers/attention/deepseek_v4_geometry.py)，
+不由 recipe 反向定义。
+
+V4 packing 采用 power-of-two 约束；capacity 同样使用 family-specific parent demand。
+P 可以是 kernel page 的正倍数，不应写死为旧文档中的 256。
+
+### Inkling
+
+[`recipes/inkling.py`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/inkling.py)
+先用公共 layer walk 建 attention group，再追加 KVConv/HiddenConv 两个 checkpoint
+column。checkpoint field 使用 flexible stride 与 K/V plane overlay，workspace 包含
+ShortConv ring。
+
+### Qwen GDN
+
+[`recipes/qwen35.py`](../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/qwen35.py)
+将重复的 linear layer position 拆成 state group，attention layer 声明 K/V，state
+layer 声明 conv/ssm。ReplaySSM 与普通 state 的 workspace/shape 差异由 recipe 处理。
+
+## 6. Arena、Pool 与 scheduler
+
+`CacheLayout.bind()` 的 plan 先交给 `CacheArena`：
+
+```text
+CacheArena
+├─ 分配 (N + 1) × parent_bytes
+├─ eager materialize 所有 typed field view
+└─ 发布 CacheRuntimeContract
 ```
-cache_budget_bytes = B
-  │
-  ├─ recipe 造 fields → solve_cache_layout：得到 packing，例如
-  │     full_attention   packing = 1   (history K/V，每 parent 1 个 128-token page)
-  │     linear_attention packing = N   (recurrent state 定长，塞得下 N 份)
-  │
-  ├─ lcm_block_bytes = lcm-align(sum(plane_bytes))       # 能被 1 和 N 整除
-  ├─ num_lcm_blocks  = (B - workspace) // lcm_block_bytes - 1   # 减 1 = null parent
-  │
-  └─ arena = torch.zeros((num_lcm_blocks + 1) * lcm_block_bytes)  # +1 = null
-        parent 0 ............ null（永不调度）
-        parent 1 ┐
-        parent 2 ├─ 每个 parent：full_attention 1 页 + linear_attention N 页
-        ...      ┘   （物理上按 plane-major 交错，field view 通过 as_strided 取出）
+
+target/draft `CachePool` 只绑定各自 layer window。scheduler bridge 从 contract 读取
+group spec、page count、packing，并生成 C++ `CacheGroupConfig`。C++ scheduling 在 token
+单位工作；LCM packing 只进入 cache allocator。
+
+## 7. 清零、PD 与 L2
+
+- hybrid/V4 pool 声明 `requires_page_zeroing`；scheduler 返回的新 block 由
+  `CacheArena.zero_blocks()` 按 field byte range 清零；
+- PD 直接传 `CacheMemoryPlan + CacheGroupSpec + CacheTransferSchema`，dtype 已在 plan；
+- Host L2 的 `CacheTransferLayout` 同样从 plan 和 pool layer selection 建立；
+- 任何路径都应复用 `field_page_byte_offset()`，不能复制 parent/child 定位公式。
+
+## 8. 数值示意
+
+若 P=128，两个 group packing 分别为 12 和 3，N=100：
+
+```text
+history page_count = 1 + 100 × 12 = 1201
+state   page_count = 1 + 100 × 3  = 301
+arena parent count = 101          # 包含 null parent
 ```
 
-调度器分配 parent 5 → full_attention 拿到 child page 5、linear_attention 拿到
-child page `5*N .. 5*N+N-1`，两者的物理字节由各自 field 的 `as_strided` view 定位，
-互不冲突且落在同一块 backing 内。
+两个 group 的 block table slot span 仍由各自 `CacheGroupSpec.block_granularity` 决定；
+不能用 `12 × P` 或 `3 × P` 替代逻辑 span。packing 只说明一个 parent 容纳多少物理
+child block。
 
----
+## 9. 维护检查表
 
-## 10. 文件索引
-
-所有 recipe 文件都在
-`python/tokenspeed/runtime/layers/attention/kv_cache/recipes/` 下。
-
-| 组件 | 位置 | 职责 |
-|---|---|---|
-| 几何引擎（LCM 数学） | `recipes/plan.py`（`solve_cache_layout:457`、`_solve_packing:363`、LCM 对齐 `:637`） | 纯整数几何：parent ↔ per-group child page 打包、plane overlay、LCM 对齐。 |
-| `CacheMemoryPlan` / `CacheLayout` | `recipes/plan.py:67` / `:218` | 容量绑定 plan / 容量无关 layout（`with_num_lcm_blocks` 连接）。 |
-| group spec / 页数 | `recipes/spec.py`（`PagedCacheGroupSpec:29`、`compute_paged_cache_group_page_counts:105`） | 几何 → 调度器契约（每组多少页、retention、transfer policy）。 |
-| 运行时契约 | `recipes/cache_runtime.py`（`PagedCacheRuntimeContract:57`） | pool 发布给 scheduler/executor 的不变式。 |
-| family 分派 | `recipes/setup.py`（`_PREPARE_CACHE:163`、`prepare_cache_setup:175`、`CachePoolSpec:66`） | family→recipe 注册表 + setup 结果容器。 |
-| 各 family recipe | `recipes/ordinary.py`（mha/mla/dsa/msa）、`kimi_k3.py`、`deepseek_v4.py`(+`deepseek_v4_cache_spec.py`)、`inkling.py`、`qwen35.py` | 造 `CacheFieldSpec` + 选 packing 策略。 |
-| 物理 arena | `kv_cache/base.py`（`CachePool:45`、`field:180`、arena `:271`、`pd_contract:242`） | 单块 arena backing，按 field 发 strided view，清零 + PD/transfer contract。 |
-| 计算接口 pool | `kv_cache/{mha,mla,dsa,msa,hybrid_*}.py`（经 `factory.create_cache_pool:12` 造） | history K/V + state 共享 arena 的 attention ABI。 |
-| registry 集成 | `layers/attention/registry.py`（family 门 `:839`-`864`、`_validate_lcm_page_size:258`） | cache_family 判定 + recipe 入口 + pool 构造。 |
-| scheduler 几何 | `engine/scheduler_utils.py`（`scheduler_cache_geometry_from_pool:79`、`pool_to_paged_cache_groups:248`） | 从 pool contract 读几何 → C++ SchedulerConfig。 |
-| 新页清零 | `execution/model_executor.py`（`zero_cache_pages:1177`） | `execution_plan.pages_to_zero` → pool `zero_new_pages`。 |
-
----
-
-## 附：维护约定
-
-本文与 `inference-flow.md` / `kvcache-management.md` 同规范：
-
-- **第 5 行 `##### commit-id: <full-sha>`** 标记上次同步的 commit。更新前先
-  `git log --oneline <sha>..HEAD` + `git diff --stat` 看改了什么，改完把 commit-id
-  换成当前 HEAD 全 sha。
-- **全文 `path:line` 锚点每个都要核对**（`sed -n 'Np'` / `grep -n` 逐个验证落在正确
-  符号上）。recipe 系文件是漂移热点：`recipes/plan.py`、`recipes/setup.py`、
-  `recipes/spec.py`、`recipes/ordinary.py`、`recipes/kimi_k3.py`、
-  `recipes/deepseek_v4.py`、`kv_cache/base.py`、`kv_cache/factory.py`、`registry.py`。
-- **注意 LCM 已是唯一 cache 路径**：不要把它写成「可选后端之一」；radix / flat-slab
-  旧体系均已删除。
+- 新 family 注册在 `recipes/setup.py::_RECIPES`；
+- group spec 与 fields 必须成对声明；
+- dtype 写入 `CacheFieldSpec`，不得由 pool 再提供；
+- kernel geometry 放在 attention/kernel 层，不应反向依赖 recipe；
+- capacity 只从 `scheduler_limits` 读并发；
+- target/draft 使用一个合并 plan、一个 arena、一个 contract；
+- 修改 plan wire 字段时同步 PD 序列化和测试。
