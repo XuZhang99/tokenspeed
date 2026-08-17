@@ -1,99 +1,103 @@
-# CachePool 运行时集成
+# Cache 运行时集成
 
-[上一篇：Arena 与 field()](field-binding.md) · [返回目录](../cache.md)
+[上一篇：Arena 与字段绑定](field-binding.md) · [返回目录](../cache.md)
 
-## 构造参数
+## 创建顺序
 
-几个容易混淆的参数如下：
+`registry.create_attn_components()` 的当前顺序是：
 
-- `size`：逻辑 pool size。基类主要将其作为元数据，以及未显式传入
-  `token_capacity` 时的缺省值；它不是 arena 的字节数。
-- `dtype`：KV 的逻辑 dtype。对于部分 FP8 dtype，底层 `store_dtype` 会改为
-  `uint8`，以规避 Torch 写入算子的限制。
-- `device`：arena 所在设备。
-- `page_size`：一个逻辑 cache block 对应的 token 数，通常等于
-  `plan.logical_block_tokens`。
-- `rank`：当前并行 rank 的元数据。
-- `memory_plan`：物理布局和显存分配的权威来源。
-- `paged_cache_group_specs`：各 group 的 family、retention、rows-per-page 等调度语义。
-- `token_capacity`：向 scheduler 公布的有效 token 容量。
-- `backing_pool`：让当前对象作为另一个 pool 的共享计算视图。
-- `field_layer_offset`：把当前 view 的局部 layer id 映射到合并 plan 中的全局 layer。
-- `pd_disaggregation_enabled`：是否允许发布 PD 分离传输契约。
+1. 根据模型能力选择 `cache_family`；
+2. `prepare_cache_setup()` 运行该 family 的统一 recipe；
+3. 从合并 spec 派生 target/draft `layer_view()`；
+4. `create_cache_arena(spec, ...)` 创建唯一 allocation；
+5. `create_cache_pool(target_spec, ..., arena)` 创建 target 计算视图；
+6. 如有 draft，再用同一个 arena 和 continuation `field_layer_offset` 创建 draft
+   计算视图；
+7. backend 配置与 scheduler 都读取 arena 发布的 group contract。
 
-## Scheduler 运行时契约
+target/draft 不通过 `backing_pool` 互相拥有；共享关系由共同的 `CacheArena` 明确表达。
 
-`_publish_runtime_contract()` 将 recipe 给出的逻辑 group spec 与 plan 中的真实
-packing/page count 对齐，生成 `PagedCacheRuntimeContract`：
+## `CacheRuntimeContract`
+
+arena 构造时发布：
 
 ```python
-PagedCacheRuntimeContract(
-    block_size=page_size,
+CacheRuntimeContract(
+    prefix_granularity=plan.prefix_granularity,
     num_lcm_blocks=plan.num_lcm_blocks,
-    token_capacity=token_capacity,
-    group_specs=aligned_group_specs,
-    group_page_counts=group_page_counts,
+    token_capacity=spec.token_capacity,
+    group_specs=spec.cache_group_specs,
+    group_page_counts={...},
+    group_packing={...},
 )
 ```
 
-Scheduler 通过该契约获得：
+[`recipes/cache_runtime.py`](../../python/tokenspeed/runtime/layers/attention/kv_cache/recipes/cache_runtime.py)
+验证每个 group：
 
-- 缓存组集合；
-- 每组的 page 数；
-- 每个 LCM 父块包含多少个该组的子 page；
-- group 的 history/state、retention 和 sliding-window 等语义；
-- 可调度的有效 token 容量。
-
-`CachePool` 因此是物理内存布局与调度器逻辑分页之间的契约边界。
-
-## 共享 backing pool
-
-Target 和异构 draft 可以共享同一个 arena。带 `backing_pool` 构造的 view：
-
-- 不分配新 buffer；
-- 复用 backing pool 的 `buffer` 和 `_fields` 注册表；
-- 继承 backing pool 的 `runtime_contract`；
-- 通过 `field_layer_offset` 绑定 draft 对应的 continuation layer。
-
-构造顺序必须是 target-first：backing pool 必须已经绑定 field 并完成 arena
-分配。共享 view 也不能重复发布 `paged_cache_group_specs`，只能继承 backing pool
-已经发布的运行时契约。
-
-## 清零与传输
-
-`CachePool` 提供两种清零方式：
-
-- `zero_blocks()`：只清零指定 group 的指定 CacheBlock，按 plan 计算原始字节区间；
-- `clear_kv_buffers()`：清空整个 arena，主要用于 sleep/wake 后修复重新映射的存储。
-
-纯 attention pool 默认不要求 page 重用时清零。KV 与 recurrent state 共享物理
-页面的 hybrid pool 会设置：
-
-```python
-paged_cache_requires_page_zeroing = True
+```text
+page_count == num_lcm_blocks × packing + 1
 ```
 
-这样可以避免旧 state 的尾部数据污染新请求。
+并要求 group spec、page-count、packing 三者的 key 集合完全一致。contract 使用
+只读 mapping，防止运行时视图修改 scheduler 几何。
 
-传输相关接口包括：
+## Python → C++ scheduler bridge
 
-- `pd_contract()`：生成 prefill/decode 分离所需的跨节点原始 slab 契约；
-- `get_pd_cache_contract()`：在启用 PD disaggregation 后返回上述契约；
-- `cache_transfer_layout()`：生成 Host L2/offload 所需的字节布局。
+[`engine/scheduler_utils.py`](../../python/tokenspeed/runtime/engine/scheduler_utils.py)
+的 `pool_to_cache_groups()` 是唯一折叠点：
 
-`pd_contract()` 要求 plan 中的全部 field 已经绑定，因为构建传输契约时需要知道
-每个 field 的实际运行时 dtype。
+- row geometry 直接传 `rows_per_page` / `entry_stride_tokens`；
+- checkpoint state 在边界折叠成等价的 token span；
+- plan 的 `group_page_counts` 与 `group_packing` 填入 C++ `CacheGroupConfig`；
+- retention、family、transfer policy 转为绑定 enum。
 
-## 创建与使用流程
+C++ scheduler 只用 `prefix_granularity` 和每组 `block_granularity` 做 token 逻辑；LCM
+packing 只作为 allocator 的物理配置传输。
 
-完整生命周期可以概括为：
+## 新 block 清零
 
-1. Cache recipe 根据模型结构和显存预算生成 `CachePoolSpec` 与
-   `CacheMemoryPlan`；
-2. `create_cache_pool()` 根据 family/config 选择具体 pool 子类；
-3. `CachePool.__init__()` 保存 plan，并发布 scheduler runtime contract；
-4. 子类在初始化时调用 `field()`，首次调用触发 arena 分配并建立所有计算 view；
-5. Scheduler 根据 runtime contract 分配 page id；
-6. Attention backend 通过具体子类的 `set_kv_buffer()` 写入，通过
-   `get_*_buffer()` 取得对应 view；
-7. PD、Host L2 和 sleep/wake 路径复用同一个 plan 描述进行传输或清零。
+纯 MHA/MLA pool 的 `requires_page_zeroing` 为 `False`。hybrid state 与 V4 pool 将它
+设为 `True`，并实现：
+
+```python
+zero_new_blocks(block_ids_by_group)
+```
+
+该方法调用 `arena.zero_blocks()`。arena 对每个 `(group, block)` 枚举该 group 的
+field，以 `field_page_byte_offset + payload_bytes` 生成 byte ranges，再由 kernel 批量
+清零。整个 sleep/wake 修复则调用 `CachePool.clear_kv_buffers()` → `arena.clear()`。
+
+target/draft 可能都被 event loop 遍历；对共享 arena 重复全量 clear 是安全的。
+
+## Host L2 transfer layout
+
+`CachePool.cache_transfer_layout()` 只选择当前 layer window 的字段，再调用
+`layout_from_lcm_plan()`。因此：
+
+- target/draft 的计算视图可以各自选择本地字段；
+- 字节 offset、stride、dtype 始终来自同一个 memory plan；
+- `combine_cache_transfer_layouts()` 可在需要时组合两侧，并保留共享 owner 语义。
+
+## PD contract
+
+PD 从 arena 建立 `CacheTransferContract`：
+
+```text
+CacheMemoryPlan + CacheGroupSpec[] + CacheTransferSchema + arena base address
+```
+
+`CacheArena.supports_disaggregation` 要求每个 group 都有 transfer policy；
+`contract_binding()` 只返回连续的 owner buffer。field 已在 arena 构造期全部物化，
+不再需要传输前检查「是否都绑定」或额外携带 dtype map。
+
+详见 [PD 分离](../pd-disaggregation.md)。
+
+## 生命周期不变量
+
+- 一个合并模型只有一个 arena allocation 和一个 runtime contract；
+- `CachePool` 的局部 layer id 必须经过 `field_layer_offset` 映射一次且仅一次；
+- scheduler/backend/PD/L2 都从 arena/plan 读取几何，不能从 pool 推导副本；
+- 需要 state sanitization 的 pool 必须声明 `requires_page_zeroing` 并实现
+  `zero_new_blocks()`；
+- `clear_kv_buffers()` 是 sleep/wake 全量操作，不等价于每步的新 block 清零。
