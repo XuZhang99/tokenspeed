@@ -65,9 +65,16 @@ public:
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
-    std::size_t AvailableKvPages() const;
-    std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
+    // Device pool parents that are empty or hold only unpinned cache entries.
+    // Scans the pool and every prefix index: a leak check for tests and
+    // diagnostics, not a per-step gauge.
+    std::int32_t AvailableLcmBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    // Per-step gauges: empty parents are O(1), active parents walk the live
+    // requests' block tables. Parents resident only as cache are
+    // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
+    std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
+    std::int32_t ActiveLcmBlocks() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
@@ -78,7 +85,6 @@ public:
     std::int32_t CacheGroupAvailablePages(const std::string& group_id) const;
 
     bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
-    std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }

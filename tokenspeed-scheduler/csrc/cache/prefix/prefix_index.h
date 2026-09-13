@@ -67,6 +67,8 @@ public:
                   std::int32_t logical_block_index = -1, CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
                   std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
+        _assert(pool.BoundGroup(block_ref->Location().lcm_block_id) == group_id_,
+                "cache block must belong to the prefix index group");
         validateKey(key);
         CacheEntries& cache_index = cacheEntries(pool);
         CacheEntryIterator existing_it = findEntry(cache_index, block_ref->Location());

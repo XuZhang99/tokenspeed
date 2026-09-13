@@ -86,6 +86,34 @@ A fourth quantity lives outside the logical world entirely:
   KV-cache-based attention (as paged KV entries) and by state-based attention
   (as a state slot). The view is defined by the consumer, not by the block.
 
+`BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
+the free child-slot count for each cache group, and the ordered set of partially
+filled LCM blocks for that group. C++ group ids are dense scheduler indices, so
+the scheduler supplies the complete packing vector when it constructs each
+pool. The per-group placement records form a vector indexed by group id, and
+each `GroupPlacement` stores immutable slots-per-parent geometry. It updates its
+free-slot count, bound-parent count and partial-parent index together on every
+occupancy transition. A parent with zero occupants is unbound, so its capacity
+belongs to the global empty-parent FIFO rather than any group.
+
+The pool knows which child slots are occupied, never who holds them. Whether a
+child is pinned by a request table, published by a prefix-cache entry, or held
+by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
+the holders; the pool does not track it, and `CacheBlockRef` does not report
+it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
+(`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
+eviction policy and leak checks, not for per-step accounting.
+
+Admission first checks the indexed free-slot and empty-parent counts. If the
+request fits, it does not enumerate eviction candidates. Under memory pressure,
+it enumerates candidates and keeps shadow occupancy only for the parents whose
+children it tentatively evicts. This makes the common zero-eviction path scale
+with cache groups and request demand rather than total cache capacity.
+
+The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
+empty parents come from the pool, active parents from the live requests' block
+tables, and cache-only residency is the remainder `total - empty - active`.
+
 ## Who is allowed to see what
 
 ### C++ scheduler: schedules in logical units
@@ -414,7 +442,10 @@ Perception rules per directory:
   `CacheBlock` index, extracted from the old `GroupAllocator`. It owns
   register/lookup/evict/pin (`Register`, `RegisterFullBlocks`, `Contains`,
   `Find`, `Evict`, `AcquireMatched`, eviction metadata). Indices are
-  pool-scoped: one index serves both the Device and Host tiers of its group.
+  pool-scoped: one index serves both the Device and Host tiers of its group. A
+  cache entry is metadata plus an owning `CacheBlockRef` that publishes an
+  existing block for reuse; registration neither allocates nor copies physical
+  storage.
 * **`PrefixMatcher`** (`prefix_matcher.h`) — the per-attention-kind match
   policy, extracted from the old manager subclasses. `FullAttnMatcher` walks
   left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
@@ -733,7 +764,9 @@ Enforced:
   between them (P divisibility, PD transfer policy, one-cache-block chunks for
   a recurrent-state group). The `Scheduler` runs it before constructing any
   member, because the pools and the coordinator assert on the same fields and
-  would otherwise preempt the diagnostic. Consequently `MakeSpecsFromConfig`
+  would otherwise preempt the diagnostic. Python callers must also pass
+  `Scheduler(config)` explicitly; the binding retains no module-lifetime
+  default configuration. Consequently `MakeSpecsFromConfig`
   is pure translation — it validates nothing;
 * the scheduler layer **transports** `cache_blocks_per_lcm_block` rather than
   reasoning with it. It appears in `csrc/scheduler/` only as a config field
