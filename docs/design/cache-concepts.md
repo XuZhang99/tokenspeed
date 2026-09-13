@@ -478,7 +478,12 @@ The conversion is `GroupGeometry` in the coordinator layer:
 
 Where reclaim needs to know whether a block is still cached, it takes the
 group's `PrefixCacheIndex` as an explicit read-only parameter — the
-dependency is visible in the signature, not hidden in shared state.
+dependency is visible in the signature, not hidden in shared state. The
+reverse direction is symmetric: publishing a table's completed blocks may
+replace one with the key's existing canonical block, and that write goes
+through a mutable window the allocator hands out
+(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`.
+The index never sees a `BlockTable`; the allocator remains its only mutator.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
 
@@ -534,7 +539,11 @@ Its responsibilities:
   ranking retraction (preemption) victims.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
-  prefix event.
+  prefix event. Whether a scheduler-level boundary is fully, partially or not
+  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
+  the group indexes), so the scheduler keeps no residency counters of its own
+  — only the token descriptor the event carries and whether that event is
+  currently out.
 
 `MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
 (group_id = index), all sharing one scheduler-level `prefix_granularity`
