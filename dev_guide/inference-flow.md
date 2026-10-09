@@ -234,6 +234,9 @@ table或 state block table；`InputBuffers`、runtime state 与 draft staging �
 初始化时先 autotune，再 capture；workspace pool 在 capture 前 freeze，避免 serving 时
 新增 scratch 改变地址。
 
+模型层使用的公共算子接口、实现注册、多硬件选择与验证流程，见
+[tokenspeed-kernel 设计架构](tokenspeed-kernel.md)。
+
 ## 12. Prefill 与 decode
 
 ### Prefill / extend
